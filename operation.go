@@ -24,6 +24,9 @@ const (
 	ReasonInsufficientFunds        RejectReason = "INSUFFICIENT_FUNDS"
 	ReasonPaymasterDepositTooLow   RejectReason = "PAYMASTER_DEPOSIT_TOO_LOW"
 	ReasonPaymasterAllowanceExceed RejectReason = "PAYMASTER_ALLOWANCE_EXCEEDED"
+	ReasonNonceGapTimeout          RejectReason = "NONCE_GAP_TIMEOUT"
+	ReasonPendingCapPerAccount     RejectReason = "PENDING_CAP_PER_ACCOUNT"
+	ReasonPendingCapGlobal         RejectReason = "PENDING_CAP_GLOBAL"
 )
 
 // OpStatus is the terminal state of an operation.
@@ -35,6 +38,7 @@ const (
 	StatusFailed   OpStatus = "FAILED_EXECUTION"
 	StatusRejected OpStatus = "REJECTED"
 	StatusReplayed OpStatus = "REPLAYED_NOOP"
+	StatusTimedOut OpStatus = "TIMED_OUT_NONCE_GAP"
 )
 
 // Operation is a user operation submitted by a smart account.
