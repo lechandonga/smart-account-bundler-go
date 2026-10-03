@@ -24,6 +24,9 @@ const (
 	ReasonInsufficientFunds        RejectReason = "INSUFFICIENT_FUNDS"
 	ReasonPaymasterDepositTooLow   RejectReason = "PAYMASTER_DEPOSIT_TOO_LOW"
 	ReasonPaymasterAllowanceExceed RejectReason = "PAYMASTER_ALLOWANCE_EXCEEDED"
+	ReasonNonceGapTimeout          RejectReason = "NONCE_GAP_TIMEOUT"
+	ReasonAccountPendingLimit      RejectReason = "ACCOUNT_PENDING_LIMIT_EXCEEDED"
+	ReasonGlobalPendingLimit       RejectReason = "GLOBAL_PENDING_LIMIT_EXCEEDED"
 )
 
 // OpStatus is the terminal state of an operation.
