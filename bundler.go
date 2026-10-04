@@ -6,9 +6,10 @@ import (
 	"sync"
 )
 
-// Bundler collects executable operations from the mempool and settles them in
-// a deterministic order. Settlement is idempotent: re-settling the same
-// operation is a recorded no-op and never charges twice.
+// Bundler settles operations from both supported entry paths and hands out
+// explainable receipts. Settlement is serialized by settleMu, and every
+// operation content ID receives exactly one terminal receipt that is never
+// overwritten by any later result.
 type Bundler struct {
 	ID      string // ledger account receiving fees
 	ledger  *Ledger
@@ -44,16 +45,29 @@ func (b *Bundler) Receipt(opID string) (Receipt, bool) {
 	return r, ok
 }
 
-// CollectAndSettle drains all currently executable operations and settles
-// them in deterministic (sender, nonce) order. One operation's failure never
-// changes the outcome of the others.
+// recordReceiptOnce stores r only if the operation ID has no terminal receipt
+// yet. Terminal states are final and unique: a later success, failure,
+// rejection or timeout can never overwrite the first one.
+func (b *Bundler) recordReceiptOnce(r Receipt) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.receipts[r.OpID]; !ok {
+		b.receipts[r.OpID] = r
+	}
+}
+
+// CollectAndSettle drains the unified queue and settles every currently
+// executable operation in deterministic (sender, nonce) order. Operations
+// whose gap wait window elapsed get an explicit TIMED_OUT_NONCE_GAP terminal
+// state; no fee is charged and no balance moves for them. One operation's
+// failure never changes the outcome of the others.
 func (b *Bundler) CollectAndSettle() []Receipt {
-	executable, timedOut := b.mempool.Process()
-	receipts := b.Settle(executable)
-	// Blocked operations whose gap wait window elapsed get an explicit,
-	// queryable terminal state. No fee is charged and no balance moves: they
-	// never executed. Their nonces have already been consumed by the mempool,
-	// so a later resubmission reports NONCE_ALREADY_USED.
+	b.settleMu.Lock()
+	defer b.settleMu.Unlock()
+
+	executable, timedOut := b.mempool.Drain()
+	receipts := b.settleMany(executable)
+
 	for _, op := range timedOut {
 		r := Receipt{
 			OpID:   op.ID(),
@@ -63,21 +77,28 @@ func (b *Bundler) CollectAndSettle() []Receipt {
 				"sender %s nonce %d timed out waiting for the gap to fill; no fee charged, no balance changes",
 				op.Sender[:8], op.Nonce),
 		}
-		b.recordReceipt(r)
-		b.mempool.markSettled(r.OpID)
+		b.recordReceiptOnce(r)
 		receipts = append(receipts, r)
 	}
+	b.mempool.Commit(idsOf(executable, timedOut)...)
 	return receipts
 }
 
-// SettleDirect settles a batch delivered straight from an external scheduler
-// without going through the queue. Every operation passes through the very
-// same admission rules as a queued submission (signature, expiry, nonce
-// history and settled-content replay); operations that never queued are
-// checked no less strictly. Admission and settlement happen per operation, so
-// a rejected operation neither moves balances nor affects the others. The
-// batch is processed in deterministic (sender, nonce) order; a nonce that
-// would open a gap is rejected with NONCE_GAP.
+// SettleDirect admits and settles a batch delivered straight from an external
+// scheduler, without callers having to queue first. Every operation passes
+// through the exact same admission rules as a queued submission (signature,
+// expiry, nonce history and settled-content replay): an operation that never
+// queued is checked no less strictly, and a nonce ahead of the account's next
+// one is suspended to wait for the gap under the configured window rather
+// than rejected on the spot.
+//
+// Admission happens per operation, so a rejected operation neither moves
+// balances nor affects the others in the batch. Operations that are already
+// executable right after admission settle immediately in deterministic
+// (sender, nonce) order; the rest remain suspended and surface later through
+// CollectAndSettle/SettleDirect, filling the gap in nonce order or reaching
+// the distinguishable timeout terminal state. Each input produces exactly one
+// receipt in the returned slice.
 func (b *Bundler) SettleDirect(ops []*Operation) []Receipt {
 	b.settleMu.Lock()
 	defer b.settleMu.Unlock()
@@ -90,40 +111,61 @@ func (b *Bundler) SettleDirect(ops []*Operation) []Receipt {
 		return ordered[i].Nonce < ordered[j].Nonce
 	})
 
-	receipts := make([]Receipt, 0, len(ordered))
-	reserved := make([]*Operation, 0, len(ordered))
 	b.mempool.mu.Lock()
 	now := b.mempool.nowUnix()
 	b.mempool.mu.Unlock()
 
+	receipts := make([]Receipt, 0, len(ordered))
 	seen := make(map[string]struct{}, len(ordered))
 	for _, op := range ordered {
 		id := op.ID()
 		if _, dupWithin := seen[id]; dupWithin {
 			r := Receipt{OpID: id, Status: StatusRejected, Reason: ReasonDuplicate,
 				Detail: rejectDetail(ReasonDuplicate, op) + " (duplicate within batch)"}
-			b.recordReceiptIfAbsent(r)
+			b.recordReceiptOnce(r)
 			receipts = append(receipts, r)
 			continue
 		}
 		seen[id] = struct{}{}
 
-		if reason, err := b.mempool.reserveDirect(op, now); reason != ReasonNone {
+		reason, _, err := b.mempool.Admit(op, now)
+		if reason != ReasonNone {
+			if reason == ReasonDuplicate {
+				// Re-delivering already terminal content through a
+				// settlement entry is a recorded no-op: the original
+				// terminal receipt is preserved and no balance moves.
+				existing, _ := b.Receipt(id)
+				r := Receipt{OpID: id, Status: StatusReplayed,
+					Reason: existing.Reason, Detail: err.Error() + "; no balance changes"}
+				b.recordReceiptOnce(r)
+				receipts = append(receipts, r)
+				continue
+			}
 			r := Receipt{OpID: id, Status: StatusRejected, Reason: reason, Detail: err.Error()}
-			b.recordReceiptIfAbsent(r)
+			b.recordReceiptOnce(r)
 			receipts = append(receipts, r)
-			continue
 		}
-		reserved = append(reserved, op)
 	}
 
-	settled := b.settleMany(reserved)
-	ids := make([]string, 0, len(reserved))
-	for _, op := range reserved {
-		ids = append(ids, op.ID())
+	// Anything that became executable through this batch (which may also
+	// include operations queued earlier by the other entry path) settles
+	// now, following the same drain/settle path as CollectAndSettle.
+	executable, timedOut := b.mempool.Drain()
+	receipts = append(receipts, b.settleMany(executable)...)
+	for _, op := range timedOut {
+		r := Receipt{
+			OpID:   op.ID(),
+			Status: StatusTimedOut,
+			Reason: ReasonNonceGapTimeout,
+			Detail: fmt.Sprintf(
+				"sender %s nonce %d timed out waiting for the gap to fill; no fee charged, no balance changes",
+				op.Sender[:8], op.Nonce),
+		}
+		b.recordReceiptOnce(r)
+		receipts = append(receipts, r)
 	}
-	b.mempool.markSettled(ids...)
-	return append(receipts, settled...)
+	b.mempool.Commit(idsOf(executable, timedOut)...)
+	return receipts
 }
 
 // Settle settles the given operations in order. It is safe to call with an
@@ -136,47 +178,28 @@ func (b *Bundler) Settle(ops []*Operation) []Receipt {
 }
 
 // settleMany performs settlement for ops already admitted/removed from the
-// mempool. The caller must hold b.settleMu.
+// mempool. The caller must hold b.settleMu. Settlement-stage rejection still
+// consumes the nonce (the mempool has already drained it), and the rejection
+// receipt is the operation's unique terminal state.
 func (b *Bundler) settleMany(ops []*Operation) []Receipt {
 	receipts := make([]Receipt, 0, len(ops))
 	for _, op := range ops {
-		receipts = append(receipts, b.settleOne(op))
+		r := b.settleOne(op)
+		b.recordReceiptOnce(r)
+		receipts = append(receipts, r)
 	}
-	ids := make([]string, 0, len(ops))
-	for _, op := range ops {
-		ids = append(ids, op.ID())
-	}
-	b.mempool.markSettled(ids...)
 	return receipts
-}
-
-func (b *Bundler) recordReceipt(r Receipt) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.receipts[r.OpID] = r
-}
-
-// recordReceiptIfAbsent keeps the original terminal receipt when an operation
-// ID was already settled and rejected again.
-func (b *Bundler) recordReceiptIfAbsent(r Receipt) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if _, ok := b.receipts[r.OpID]; !ok {
-		b.receipts[r.OpID] = r
-	}
 }
 
 func (b *Bundler) settleOne(op *Operation) Receipt {
 	id := op.ID()
 
-	b.mu.Lock()
-	if _, ok := b.receipts[id]; ok {
-		b.mu.Unlock()
-		// Replay: the original receipt stays recorded; the caller gets a
-		// REPLAYED_NOOP and no balance moves.
-		return Receipt{OpID: id, Status: StatusReplayed, Detail: "already settled; no balance changes"}
+	if existing, ok := b.Receipt(id); ok {
+		// Replay: the original terminal receipt stays recorded; the caller
+		// gets a REPLAYED_NOOP and no balance moves.
+		return Receipt{OpID: id, Status: StatusReplayed,
+			Reason: existing.Reason, Detail: "already settled; no balance changes"}
 	}
-	b.mu.Unlock()
 
 	var r Receipt
 	switch {
@@ -186,10 +209,6 @@ func (b *Bundler) settleOne(op *Operation) Receipt {
 		r = b.settleSelfPaid(op)
 	}
 	r.OpID = id
-
-	b.mu.Lock()
-	b.receipts[id] = r
-	b.mu.Unlock()
 	return r
 }
 
@@ -238,4 +257,15 @@ func (b *Bundler) execute(op *Operation) Receipt {
 		b.ledger.transfer(op.Sender, op.Target, op.Value)
 	}
 	return Receipt{Status: StatusSuccess, Detail: fmt.Sprintf("settled; fee %d to bundler %s", op.Fee, b.ID)}
+}
+
+func idsOf(executable, timedOut []*Operation) []string {
+	ids := make([]string, 0, len(executable)+len(timedOut))
+	for _, op := range executable {
+		ids = append(ids, op.ID())
+	}
+	for _, op := range timedOut {
+		ids = append(ids, op.ID())
+	}
+	return ids
 }
