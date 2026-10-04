@@ -48,12 +48,22 @@ func (b *Bundler) Receipt(opID string) (Receipt, bool) {
 // them in deterministic (sender, nonce) order. One operation's failure never
 // changes the outcome of the others.
 func (b *Bundler) CollectAndSettle() []Receipt {
+	b.settleMu.Lock()
+	defer b.settleMu.Unlock()
 	executable, timedOut := b.mempool.Process()
-	receipts := b.Settle(executable)
-	// Blocked operations whose gap wait window elapsed get an explicit,
-	// queryable terminal state. No fee is charged and no balance moves: they
-	// never executed. Their nonces have already been consumed by the mempool,
-	// so a later resubmission reports NONCE_ALREADY_USED.
+	receipts := b.settleMany(executable)
+	receipts = append(receipts, b.finalizeTimeouts(timedOut)...)
+	return receipts
+}
+
+// finalizeTimeouts records the terminal state of operations whose gap wait
+// window elapsed. No fee is charged and no balance moves: they never
+// executed. Their nonces have already been consumed by the mempool, so a
+// later resubmission reports the nonce as used. A terminal receipt that
+// already exists (e.g. the operation settled through another entry path
+// first) is never overwritten. The caller must hold b.settleMu.
+func (b *Bundler) finalizeTimeouts(timedOut []*Operation) []Receipt {
+	receipts := make([]Receipt, 0, len(timedOut))
 	for _, op := range timedOut {
 		r := Receipt{
 			OpID:   op.ID(),
@@ -63,7 +73,7 @@ func (b *Bundler) CollectAndSettle() []Receipt {
 				"sender %s nonce %d timed out waiting for the gap to fill; no fee charged, no balance changes",
 				op.Sender[:8], op.Nonce),
 		}
-		b.recordReceipt(r)
+		b.recordReceiptIfAbsent(r)
 		b.mempool.markSettled(r.OpID)
 		receipts = append(receipts, r)
 	}
@@ -71,13 +81,20 @@ func (b *Bundler) CollectAndSettle() []Receipt {
 }
 
 // SettleDirect settles a batch delivered straight from an external scheduler
-// without going through the queue. Every operation passes through the very
-// same admission rules as a queued submission (signature, expiry, nonce
-// history and settled-content replay); operations that never queued are
-// checked no less strictly. Admission and settlement happen per operation, so
-// a rejected operation neither moves balances nor affects the others. The
-// batch is processed in deterministic (sender, nonce) order; a nonce that
-// would open a gap is rejected with NONCE_GAP.
+// scheduler. Admission is literally the queued-submission path: every
+// operation — including ones that never entered the queue — goes through
+// Mempool.Submit, so signature, expiry, nonce history, settled-content
+// replay and capacity conclusions are identical for both entry paths. A
+// nonce gap is not rejected: the operation waits in the queue for the
+// configured window, exactly like a queued submission, and either takes
+// effect in nonce order once the gap fills or ends in the distinguishable
+// TIMED_OUT_NONCE_GAP state. A rejected operation never moves balances and
+// never affects the rest of the batch.
+//
+// The returned receipts follow the deterministic (sender, nonce) order of
+// the batch, one receipt per distinct operation. Operations still waiting
+// for a missing nonce report PENDING; their terminal receipt becomes
+// available through Receipt once a later collection settles or times out.
 func (b *Bundler) SettleDirect(ops []*Operation) []Receipt {
 	b.settleMu.Lock()
 	defer b.settleMu.Unlock()
@@ -90,40 +107,48 @@ func (b *Bundler) SettleDirect(ops []*Operation) []Receipt {
 		return ordered[i].Nonce < ordered[j].Nonce
 	})
 
-	receipts := make([]Receipt, 0, len(ordered))
-	reserved := make([]*Operation, 0, len(ordered))
-	b.mempool.mu.Lock()
-	now := b.mempool.nowUnix()
-	b.mempool.mu.Unlock()
-
+	byID := make(map[string]Receipt, len(ordered))
+	ids := make([]string, 0, len(ordered))
 	seen := make(map[string]struct{}, len(ordered))
 	for _, op := range ordered {
 		id := op.ID()
-		if _, dupWithin := seen[id]; dupWithin {
-			r := Receipt{OpID: id, Status: StatusRejected, Reason: ReasonDuplicate,
-				Detail: rejectDetail(ReasonDuplicate, op) + " (duplicate within batch)"}
-			b.recordReceiptIfAbsent(r)
-			receipts = append(receipts, r)
-			continue
+		if _, dup := seen[id]; dup {
+			continue // identical operation repeated within the batch
 		}
 		seen[id] = struct{}{}
-
-		if reason, err := b.mempool.reserveDirect(op, now); reason != ReasonNone {
+		ids = append(ids, id)
+		if reason, err := b.mempool.Submit(op); err != nil {
 			r := Receipt{OpID: id, Status: StatusRejected, Reason: reason, Detail: err.Error()}
 			b.recordReceiptIfAbsent(r)
-			receipts = append(receipts, r)
-			continue
+			byID[id] = r
 		}
-		reserved = append(reserved, op)
 	}
 
-	settled := b.settleMany(reserved)
-	ids := make([]string, 0, len(reserved))
-	for _, op := range reserved {
-		ids = append(ids, op.ID())
+	executable, timedOut := b.mempool.Process()
+	for _, r := range b.settleMany(executable) {
+		byID[r.OpID] = r
 	}
-	b.mempool.markSettled(ids...)
-	return append(receipts, settled...)
+	for _, r := range b.finalizeTimeouts(timedOut) {
+		byID[r.OpID] = r
+	}
+	// Operations admitted but still blocked by a missing nonce keep waiting
+	// for the remainder of the gap window; PENDING is not a terminal state
+	// and is deliberately not recorded over any existing receipt.
+	for _, op := range ordered {
+		id := op.ID()
+		if _, done := byID[id]; done {
+			continue
+		}
+		byID[id] = Receipt{OpID: id, Status: StatusPending, Detail: fmt.Sprintf(
+			"sender %s nonce %d queued by direct batch, waiting for the missing nonce within the gap window",
+			op.Sender[:8], op.Nonce)}
+	}
+
+	receipts := make([]Receipt, 0, len(ids))
+	for _, id := range ids {
+		receipts = append(receipts, byID[id])
+	}
+	return receipts
 }
 
 // Settle settles the given operations in order. It is safe to call with an

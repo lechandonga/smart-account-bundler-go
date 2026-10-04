@@ -147,8 +147,18 @@ func (m *Mempool) admitLocked(op *Operation) (RejectReason, error) {
 		return ReasonNonceUsed, fmt.Errorf("operation %s: nonce %d already effective for sender (next=%d)",
 			op.ID()[:8], op.Nonce, m.nextNonce[op.Sender])
 	}
-	if _, ok := m.pending[op.Sender][op.Nonce]; ok {
+	if existing, ok := m.pending[op.Sender][op.Nonce]; ok {
+		if existing.ID() == op.ID() {
+			// The exact same operation is already suspended: admission is
+			// an idempotent no-op so both entry paths stay consistent.
+			return ReasonNone, nil
+		}
 		return ReasonNonceUsed, fmt.Errorf("operation %s: nonce %d already pending for sender", op.ID()[:8], op.Nonce)
+	}
+	if op.Nonce == m.nextNonce[op.Sender] {
+		// Immediately executable; it is never suspended, so it does not
+		// compete for pending capacity.
+		return ReasonNone, nil
 	}
 	if m.MaxPendingPerAccount > 0 && len(m.pending[op.Sender]) >= m.MaxPendingPerAccount {
 		return ReasonPendingCapPerAccount, fmt.Errorf("operation %s: per-account pending cap %d reached for sender",
@@ -164,34 +174,6 @@ func (m *Mempool) admitLocked(op *Operation) (RejectReason, error) {
 				op.ID()[:8], m.MaxPendingTotal)
 		}
 	}
-	return ReasonNone, nil
-}
-
-// reserveDirect admits an operation delivered straight to settlement without
-// ever queuing. Admission is identical to Submit's: same signature, expiry,
-// settled-content and nonce-history checks. In addition the nonce must be
-// exactly the account's next one (a direct batch cannot introduce a waiting
-// gap). On success the nonce is reserved atomically, so concurrent settlers
-// can never consume the same nonce twice. The caller must hold no lock.
-func (m *Mempool) reserveDirect(op *Operation, now uint64) (RejectReason, error) {
-	if reason, ok := precheck(op, now); !ok {
-		return reason, fmt.Errorf("%s", rejectDetail(reason, op))
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.settled[op.ID()]; ok {
-		return ReasonDuplicate, fmt.Errorf("%s", rejectDetail(ReasonDuplicate, op))
-	}
-	next := m.nextNonce[op.Sender]
-	switch {
-	case op.Nonce < next:
-		return ReasonNonceUsed, fmt.Errorf("operation %s: nonce %d already effective for sender (next=%d)",
-			op.ID()[:8], op.Nonce, next)
-	case op.Nonce > next:
-		return ReasonNonceGap, fmt.Errorf("operation %s: nonce %d skips expected nonce %d for sender",
-			op.ID()[:8], op.Nonce, next)
-	}
-	m.nextNonce[op.Sender] = next + 1
 	return ReasonNone, nil
 }
 
@@ -223,7 +205,17 @@ func (m *Mempool) Process() (executable, timedOut []*Operation) {
 func (m *Mempool) processLocked(now uint64) (executable, timedOut []*Operation) {
 	window := uint64(m.gapWindow().Seconds())
 	for sender, byNonce := range m.pending {
+		// Converge suspended entries that can never execute anymore: the
+		// identical operation was already settled through another entry
+		// path, or the nonce already took effect (a different-content op
+		// with the same nonce must not hang until timeout). Their terminal
+		// state, if any, is already recorded; nothing is emitted here.
 		next := m.nextNonce[sender]
+		for nonce, op := range byNonce {
+			if _, done := m.settled[op.ID()]; done || nonce < next {
+				delete(byNonce, nonce)
+			}
+		}
 		for {
 			op, ok := byNonce[next]
 			if !ok {
@@ -242,7 +234,7 @@ func (m *Mempool) processLocked(now uint64) (executable, timedOut []*Operation) 
 				m.gapSince[sender] = now
 			}
 			if window > 0 && now-since >= window {
-				high := next - 1
+				high := next
 				for nonce, op := range byNonce {
 					timedOut = append(timedOut, op)
 					if nonce > high {
@@ -274,14 +266,6 @@ func sortOps(ops []*Operation) {
 		}
 		return ops[i].Nonce < ops[j].Nonce
 	})
-}
-
-// drainExecutable removes and returns, for every sender, the contiguous run of
-// operations starting at the sender's next nonce. Gaps stay queued (unless
-// their wait window has elapsed, in which case blocked ops time out).
-func (m *Mempool) drainExecutable() []*Operation {
-	executable, _ := m.Process()
-	return executable
 }
 
 // markSettled records op IDs so replays are detectable on every entry path.
